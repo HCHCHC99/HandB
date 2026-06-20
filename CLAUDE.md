@@ -23,7 +23,7 @@ All source code lives under `T_v.4.36.15_20260428/HC32F460_DDL_Rev3.3.0/`.
 ```
 projects/ev_hc32f460_lqfp100_v2/
 ├── Adp/          # Hardware adapter layer (rs485, PWM, ADC, DMA, GPIO, timers, flash)
-├── App/          # Application logic (motor control, comm, fault, realtime)
+├── App/          # Application logic (motor control, comm, fault, realtime, project glue)
 ├── Dev/          # Device drivers (motor, ADC, hall, voltage, sensor, EventBus, DeviceManager)
 ├── Utils/        # Utilities (ring_buf, msg_queue, lock, param_manager, TickTimer)
 ├── RTT/          # SEGGER RTT debug output
@@ -31,6 +31,99 @@ projects/ev_hc32f460_lqfp100_v2/
     ├── source/   # main.c, main.h, hc32f4xx_conf.h
     └── MDK/      # Keil project, startup, linker scripts, JLink config
 ```
+
+### Key files
+
+- **`App/App_Motor_Project.c/h`** — Glue layer: `ESystem_Init()` registers all 16 devices with DeviceManager, sets up EventBus subscribers, and initializes the simulation struct. `ESystem_MainLoop()` calls `DeviceManager_Update()` and runs the simulation tick.
+- **`template/source/main.c`** — Entry point. Owns the init sequence (see below), the 4-channel PWM globals, and the main `while(1)` loop.
+
+## Initialization Sequence (main.c)
+
+```
+Hardware_Init()           # Clocks, GPIO, NVIC, peripherals
+App_Comm_Init(&cfg)       # 4-layer comm stack (RS485 -> Comm_HAL -> Modbus -> App)
+ESystem_Init()            # DeviceManager, EventBus subscribers, simulation struct
+FaultHandler_Init()       # Subscribes to TOPIC_VOLTAGE_ALARM + TOPIC_CURRENT_ALARM
+Motor_Pwm_Init()          # 4-channel PWM on PB6-PB9, 20kHz, active-low
+EventBus_Enable()         # Replays deferred events, enables real-time publish
+
+while(1):
+    ESystem_MainLoop()    # DeviceManager_Update() + simulation tick
+    App_Comm_Poll()       # Comm_HAL_RecvFrame -> ModbusRTU_ProcessFrame -> callbacks
+    PWM_Update() x4       # Reload PWM duty registers
+    Param_PrintAllValues()# Debug: prints all params via RTT every loop
+```
+
+When adding a new module, insert its init between `ESystem_Init()` and `EventBus_Enable()`. If it subscribes to EventBus topics, init after `ESystem_Init()` so the topics are registered.
+
+## PWM Hardware Configuration
+
+- **MCU pins:** PB6 (CH1), PB7 (CH2), PB8 (CH3), PB9 (CH4)
+- **Timer:** TMRA_4, sawtooth up-counting mode
+- **Frequency:** 20kHz (period = 6000 counts)
+- **Polarity:** Active-low (`PWM_ACTIVE_LOW`)
+- **Global instances:** `g_motor_pwm_ch1` through `g_motor_pwm_ch4` (declared in main.c)
+- PWM output is enabled at init; duty is controlled by `PWM_SetDuty()` calls from the motor arbitration layer
+
+## Debug Logging (SEGGER RTT)
+
+All debug output goes through SEGGER RTT, **not** UART. View with JLink RTT Viewer or similar.
+
+**Multi-channel + color-coded logging** (`RTT/rtt_log.h`):
+
+| Channel | Tag | Color | Purpose |
+|---------|-----|-------|---------|
+| LOG_CH_MAIN (0) | MAIN | Cyan | Main program flow |
+| LOG_CH_USB (1) | USB | Green | USB module |
+| LOG_CH_SENSOR (2) | SENSOR | Cyan | Sensor readings |
+| LOG_CH_MOTOR (3) | MOTOR | Cyan | Motor control |
+| LOG_CH_COMM (4) | COMM | Cyan | Communication stack |
+| LOG_CH_UI (5) | UI | Cyan | User interface |
+
+**Per-channel macros** follow the pattern: `MAIN_D()`, `MAIN_I()`, `MAIN_W()`, `MAIN_E()` (Debug/Info/Warn/Error). Same for `COMM_D()`, `MOTOR_D()`, etc.
+
+Legacy macros `COMM_DBG()`, `HAL_DEBUG()` used in older code map to the COMM channel macros above.
+
+## Simulation Mode
+
+Enabled by default (`ENABLE_SIMULATION_MODE=1` in `App_Motor_Project.c`). The `g_sim` struct holds simulated hardware signals:
+- Power output states (forward/reverse relays)
+- Hall sensor limits (forward/reverse limit switches)
+- IO button states
+- ADC values (voltage, current)
+
+The main loop calls `Sim_Update()` which detects changes on `g_sim` and publishes corresponding EventBus events. This allows full motor arbitration testing **without physical hardware** — the EventBus subscribers react identically to real and simulated events.
+
+To test a specific scenario: modify `g_sim` fields (e.g., set `g_sim.adc_current` above the overcurrent threshold) and observe the fault/fault-clear cycle via RTT logs.
+
+## Testing via Modbus
+
+No unit test framework exists. All testing is done through Modbus RTU commands:
+
+```bash
+# Edit config at top of modbus_test_cmds.py, then:
+py modbus_test_cmds.py
+```
+
+The script generates hex command frames for all Modbus operations. Copy the output hex to your RS485 master tool.
+
+**Quick command reference** (node_id=1):
+
+| Operation | Hex Frame |
+|-----------|-----------|
+| Read speed (0x2730) | `01 03 27 30 00 01 CRC` |
+| Write START | `01 06 27 20 00 01 CRC` |
+| Write FWD | `01 06 27 20 00 11 CRC` |
+| Write STOP | `01 06 27 20 00 02 CRC` |
+| Clear all faults | `01 06 27 40 00 00 CRC` |
+
+## Known Code Issues (from Security Review)
+
+The file `安全审查报告.md` documents 9 findings. Key issues to be aware of when modifying code:
+
+1. **`Protocol_ModbusRtu.c:63-64`** — `ModbusRTU_SendResponse` writes CRC at `raw[len]` and `raw[len+1]` without checking `len + 2 <= 256`. Currently safe (max `len = 253`), but add a guard if protocol framing changes.
+2. **`Protocol_ModbusRtu.c:254`** — `ModbusRTU_ProcessFrame` does `memcpy(frame, len)` without checking `len <= 256`. Currently safe because `Comm_HAL_RecvFrame` caps at 256, but add a guard if that contract changes.
+3. **`App_Comm.c:183`** — Every single-register write calls `Param_Save()` which triggers Flash sector erase. Multi-register writes (0x10) batch correctly (one save for all registers), but rapid single-write sequences cause excessive Flash wear. Consider adding a debounce timer if single-write frequency increases.
 
 ## 4-Layer Communication Stack (strict top-down dependency)
 
@@ -58,10 +151,6 @@ rs485.c/h              — Pure hardware: USART4 + PA03 direction pin + ISRs
 - **Param Manager** (`Utils/param_manager.h`): Register-based parameter storage with Flash persistence. Parameters live in `g_AppParam` (type `AppParamRecord_t`). Read/write via `Param_ReadByReg()`/`Param_WriteByReg()`, save via `Param_Save()`. Uses wear-leveled Flash storage across sectors 56-62 with CRC32 validation, sequence numbers, and magic headers.
 
 - **Motor arbitration** (`Dev/dev_motor.c`): Commands go through the motor arbitrator which decides whether to allow based on mode (auto/remote/manual). Uses a `block_fwd`/`block_rev` bitmask — multiple devices can independently block a direction (e.g., overcurrent adds `DEV_ID_OVERCUR_FWD`, limit switches add `DEV_ID_RTURN_FWD`). Arbitration re-evaluates on every block/unblock.
-
-- **Simulation mode** (`ENABLE_SIMULATION_MODE=1` in `App_Motor_Project.c`): Enabled by default. The `g_sim` struct holds simulated hardware signals (power, Hall limits, IO buttons, ADC values). The main loop detects state changes on `g_sim` and publishes corresponding EventBus events, allowing full motor arbitration testing without physical hardware.
-
-- **SEGGER RTT** (`RTT/`): Debug logging via `MAIN_D()`, `COMM_DBG()`, `HAL_DEBUG()` macros — these output through RTT, not UART.
 
 ## Fault System
 
@@ -93,7 +182,7 @@ Bits written via Modbus function 0x06 (single write only):
 | bit4 | 0x0010 | FWD — forward (requires START first, uses `g_AppParam.target_speed`) |
 | bit5 | 0x0020 | REV — reverse (requires START first, uses `g_AppParam.target_speed`) |
 
-Typical sequence: START (0x0001) → FWD (0x0011) → STOP (0x0002)
+Typical sequence: START (0x0001) -> FWD (0x0011) -> STOP (0x0002)
 
 ## Important Constraints
 
